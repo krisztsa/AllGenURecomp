@@ -50,7 +50,7 @@ A diferencia de jugar en la consola original o mediante emulación tradicional, 
 
 ### ⏱️ 2. Tasa de Fotogramas Desbloqueada (30 a 240 FPS)
 * **Framerate Nativo Configurable:** Juega a **30, 60, 90, 120, 144 o hasta 240 FPS** reales sin generación de fotogramas falsa y con físicas 1:1.
-* **Control Total de VSync:** Activa o desactiva la sincronización vertical en `allgenurecomp.ini`.
+* **Control Total de VSync:** Activa o desactiva la sincronización vertical.
 * **Avance Rápido de Cinemáticas:** Mantén pulsado el botón **A** para acelerar cualquier cinemática no omitible.
 
 ### 🌐 3. Multijugador LAN / Online Directo y Mejoras Cooperativas

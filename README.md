@@ -87,7 +87,7 @@ A diferencia de jugar en la consola original o mediante emulación tradicional, 
 
 ## 📥 Guía de Instalación Paso a Paso
 
-1. **Descarga la última versión:** Ve a la sección de [Releases de AllGenURecomp](https://github.com/krisztsa/AllGenURecomp/releases) y descarga el archivo `.zip` correspondiente a tu plataforma (Windows o Linux).
+1. **Descarga la última versión:** Ve a la sección de [Releases de AllGenURecomp](https://github.com/krisztsa/AllGenURecomp/releases) y descarga el archivo `.zip` correspondiente a tu plataforma (Windows).
 2. **Extrae el port:** Descomprime el archivo en la carpeta que prefieras, por ejemplo `C:\Games\AllGenURecomp\`.
 3. **Prepara los archivos de tu juego (v1.4.0):** Necesitas las carpetas `exefs` (de la actualización 1.4.0) y `romfs` (el juego base fusionado con la actualización 1.4.0) extraídas de tu Nintendo Switch o desde Ryujinx (*clic derecho en el juego con el update 1.4.0 aplicado → Extract Data*).
 4. **Coloca los datos en la carpeta `data/`:** Copia `exefs` y `romfs` dentro de la subcarpeta `data` del port para que quede exactamente con esta estructura:
@@ -198,18 +198,6 @@ make -j8 GAME=/c/ruta/a/tu/juego
 
 Esto generará la carpeta `build/` lista para jugar con `allgenurecomp.exe`, `allgenugame.dll`, las librerías `.dll` necesarias y enlaces duros en `build/data/`. Puedes iniciar el juego ejecutando `run-game.bat` para mantener tus archivos de configuración y mods organizados en `run/`.
 
-### 3. Compilación Nativa en Linux
-
-En distribuciones Linux (con `clang`, `lld`, `sdl3`, `vulkan`, `shaderc`, `ffmpeg` y `python3` instalados):
-
-```bash
-python3 -m venv tools/venv && tools/venv/bin/pip install -r tools/requirements.txt
-make gen GAME=../mhgu/game
-make -j8 GAME=../mhgu/game
-cd build && ./allgenurecomp
-```
-
----
 
 ## 🗂️ Estructura del Repositorio
 

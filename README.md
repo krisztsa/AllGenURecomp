@@ -1,6 +1,6 @@
 # ⚔️ AllGenURecomp — Monster Hunter Generations Ultimate Native PC Port 🐉🔥
 
-**Port nativo para PC (Windows y Linux) de Monster Hunter Generations Ultimate (Nintendo Switch, v1.4.0) mediante recompilación estática de código (AOT — Ahead-of-Time), logrando rendimiento nativo en hardware moderno sin necesidad de emulación pesada.**
+**Port nativo para PC (Windows) de Monster Hunter Generations Ultimate (Nintendo Switch, v1.4.0) mediante recompilación estática de código (AOT — Ahead-of-Time), logrando rendimiento nativo en hardware moderno sin necesidad de emulación pesada.**
 
 > ⚠️ **AVISO OFICIAL E IMPORTANTE:**
 > **AllGenURecomp** es una recompilación estática de *Monster Hunter Generations Ultimate (NS)*, es **completamente gratuita** y si obtuviste este port de pago **has sido estafado**, la única vía oficial es nuestro GitHub: [https://github.com/krisztsa/AllGenURecomp](https://github.com/krisztsa/AllGenURecomp).

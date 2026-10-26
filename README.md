@@ -72,7 +72,7 @@ A diferencia de jugar en la consola original o mediante emulación tradicional, 
 
 | Componente | Especificación Mínima / Recomendada |
 | :--- | :--- |
-| **Sistema Operativo** | Windows 10 / 11 (64-bit) o Linux (64-bit, probado también en Steam Deck) |
+| **Sistema Operativo** | Windows 10 / 11 (64-bit) |
 | **Procesador (CPU)** | Cualquier CPU de 2014 o superior con soporte **AVX2** (o compilación `x86-64-v2` para CPUs antiguos) |
 | **Tarjeta Gráfica (GPU)** | Cualquier GPU de 2016 o superior compatible con **Vulkan 1.2** y al menos **1 GB de VRAM** |
 | **Memoria RAM** | 4 GB de RAM o superior |

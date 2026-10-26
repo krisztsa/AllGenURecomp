@@ -56,8 +56,6 @@ A diferencia de jugar en la consola original o mediante emulación tradicional, 
 ### 🌐 3. Multijugador LAN / Online Directo y Mejoras Cooperativas
 * **Multijugador Local Wireless sobre IP:** Funciona directamente en red local (LAN / VLAN como ZeroTier o Radmin VPN) o por Internet abriendo el puerto `39500` (TCP/UDP).
 * **Misiones de Aldea (Village Quests) en Multijugador:** Pulsa **L / R** en el mostrador de misiones del Hub / Cuartel para publicar misiones de la Aldea en cooperativo con tus amigos, con escalado automático de vida del monstruo (`HubHP = 2.0` por defecto).
-* **Sincronización de Monstruos Pequeños (`SyncSmallMonsters`):** Opción para sincronizar exactamente la posición de los monstruos pequeños entre todos los cazadores de la sala.
-* **Escalado Dinámico de HP por Jugadores (`[Monster HP]`):** Configura multiplicadores personalizados de vida para 1, 2, 3 o 4 cazadores en el Hub.
 
 ### 🎮 4. Soporte Universal de Mandos y Teclado + Ratón
 * **Compatibilidad Total con Mandos (SDL3):** Funciona de inmediato con mandos de Xbox, DualShock 4, DualSense (PS5), Nintendo Switch Pro Controller, Steam Deck y genéricos. Opción `FaceButtons = Label` o `Position` para intercambiar botones A/B y X/Y.

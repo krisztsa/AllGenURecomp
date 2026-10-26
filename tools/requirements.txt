@@ -1,0 +1,3 @@
+lz4>=4.0        # NSO decompression (gen.py, nso.py)
+capstone>=5.0   # disassembly (disasm.py, retool.py)
+unicorn>=2.0    # recompiler differential test (test_lift.py, make test-lift)

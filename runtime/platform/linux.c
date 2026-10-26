@@ -1,0 +1,299 @@
+// Linux host layer (runtime/platform.h).
+//
+// The guest window is reserved PROT_NONE up front and pages are backed on their first touch by the SIGSEGV handler
+// below (64 KB at a time), exactly as windows.c does with MEM_RESERVE + MEM_COMMIT.
+//
+// Differences from Windows worth knowing:
+// - No GetWriteWatch equivalent: plat_written_pages() reports "no write tracking" (-1), so the renderer checks
+//   texture / buffer contents itself instead of trusting a dirty-page list (runtime/nvn/vulkan/textures.c).
+// - Signal handlers are process-wide, so one SIGSEGV handler does both jobs: back a guest page, or report the fault.
+//   It is installed by plat_reserve_guest(), i.e. from main.c's constructor, before any guest code can run.
+// - No console to keep or free: with stderr not a terminal nobody is watching, so the log goes to log.txt.
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <execinfo.h>
+#include <limits.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/ucontext.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "../platform.h"
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+// ---- guest address space
+static uint64_t g_lo, g_hi;
+#define COMMIT_CHUNK 0x10000ull
+#define MAX_CHUNKS ((0x100000000ull + COMMIT_CHUNK - 1) / COMMIT_CHUNK)
+
+// Per-chunk state, so the fault handler can tell "not backed yet" (back it and resume) from a real fault in backed
+// memory (report it) without a lock: a signal handler may not take one, and several guest threads faulting into the
+// same fresh chunk is the normal case. 0 not backed, 1 somebody is backing it, 2 backed.
+enum { CHUNK_FREE = 0, CHUNK_BUSY, CHUNK_READY };
+static _Atomic unsigned char g_chunk[MAX_CHUNKS];
+
+static bool chunk_back(uint64_t base) {
+    void *p = mmap((void *)(uintptr_t)base, COMMIT_CHUNK, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0);
+    return p == (void *)(uintptr_t)base;
+}
+
+// The faulting address is inside the window and its chunk is not backed: back it. True = resume the instruction.
+static bool lazy_commit(uint64_t a) {
+    if (a < g_lo || a >= g_hi) return false;
+    uint64_t idx = (a - g_lo) / COMMIT_CHUNK;
+    if (idx >= MAX_CHUNKS) return false;
+    unsigned char expect = CHUNK_FREE;
+    if (atomic_compare_exchange_strong(&g_chunk[idx], &expect, CHUNK_BUSY)) {
+        bool ok = chunk_back(g_lo + idx * COMMIT_CHUNK);
+        atomic_store(&g_chunk[idx], ok ? CHUNK_READY : CHUNK_FREE);
+        return ok;
+    }
+    while (atomic_load(&g_chunk[idx]) == CHUNK_BUSY) atomic_thread_fence(memory_order_acquire);
+    return atomic_load(&g_chunk[idx]) == CHUNK_READY;  // (whoever won it backed the page: resume)
+}
+
+static void fault_handler(int sig, siginfo_t *si, void *uc);
+
+bool plat_reserve_guest(uint64_t base, uint64_t size) {
+    void *p = mmap((void *)(uintptr_t)base, size, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE | MAP_NORESERVE, -1, 0);
+    if (p != (void *)(uintptr_t)base) return false;
+    g_lo = base;
+    g_hi = base + size;
+    struct sigaction sa = {0};
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    return true;
+}
+
+void plat_commit(uint64_t addr, uint64_t size) {
+    if (!size) return;
+    uint64_t a = addr & ~(COMMIT_CHUNK - 1), e = (addr + size + COMMIT_CHUNK - 1) & ~(COMMIT_CHUNK - 1);
+    for (uint64_t c = a; c < e && c < g_hi; c += COMMIT_CHUNK) lazy_commit(c);
+    if (e > g_hi)
+        fprintf(stderr, "[plat] commit %llx+%llx past the guest window\n", (unsigned long long)addr,
+                (unsigned long long)size);
+}
+
+int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, uint64_t *page) {
+    (void)addr; (void)size; (void)pages; (void)max; (void)page;
+    return -1;  // no write watching here: the renderer compares contents
+}
+
+bool plat_committed(uint64_t addr, uint64_t *end) {
+    if (!g_lo || addr < g_lo || addr >= g_hi) { *end = addr + PLAT_PAGE; return false; }
+    uint64_t idx = (addr - g_lo) / COMMIT_CHUNK;
+    if (atomic_load(&g_chunk[idx]) != CHUNK_READY) {
+        *end = g_lo + (idx + 1) * COMMIT_CHUNK;
+        return false;
+    }
+    uint64_t n = idx;
+    while (n + 1 < MAX_CHUNKS && n - idx < 4096 && atomic_load(&g_chunk[n + 1]) == CHUNK_READY) n++;
+    *end = g_lo + (n + 1) * COMMIT_CHUNK;
+    return true;
+}
+
+int plat_protect(uint64_t addr, uint64_t size, int prot) {
+    int p = prot == PLAT_PROT_NONE ? PROT_NONE : prot == PLAT_PROT_READ ? PROT_READ : PROT_READ | PROT_WRITE;
+    if (addr >= g_lo && addr < g_hi) plat_commit(addr, size);
+    return mprotect((void *)(uintptr_t)addr, size, p) == 0 ? 0 : -1;
+}
+
+// ---- time
+uint64_t plat_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+void plat_sleep_until_ns(uint64_t t) {
+    for (;;) {
+        uint64_t now = plat_now_ns();
+        if (now >= t) return;
+        uint64_t left = t - now;
+        if (left < 200000) { sched_yield(); continue; }  // (the last bit: spinning beats a syscall)
+        struct timespec due = {(time_t)(left / 1000000000ull), (long)(left % 1000000000ull)};
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &due, NULL);  // (EINTR: the loop re-reads the clock)
+    }
+}
+
+// ---- process
+void plat_init(void) {
+    // send() on a dropped Local Play connection gives EPIPE here instead of killing the process: Windows reports
+    // WSAEPIPE to the caller, which is what nn::socket expects.
+    signal(SIGPIPE, SIG_IGN);
+}
+
+bool plat_exe_path(char *buf, size_t size) {
+    ssize_t n = readlink("/proc/self/exe", buf, size - 1);
+    if (n <= 0 || (size_t)n >= size - 1) return false;
+    buf[n] = 0;
+    return true;
+}
+
+// Started on its own: run in the executable's folder (MHGU_HOME: in that folder instead); with nobody watching stderr (a launcher, a .desktop entry, `&`)
+// the log goes to log.txt and plat_fatal_notice then points the player at it.
+static bool g_own_log;
+
+void plat_standalone(void) {
+    char exe[PATH_MAX];
+    const char *home = getenv("MHGU_HOME");
+    if (home && *home) {
+        mkdir(home, 0755);
+        if (chdir(home) != 0) { /* the folder we are in will do */ }
+    } else if (plat_exe_path(exe, sizeof exe)) {
+        char *s = strrchr(exe, '/');
+        if (s) { *s = 0; if (chdir(exe) != 0) { /* the folder we are in will do */ } }
+    }
+    if (!isatty(STDERR_FILENO)) {
+        if (freopen("log.txt", "w", stderr)) { setvbuf(stderr, NULL, _IONBF, 0); g_own_log = true; }
+    }
+}
+
+// [AllGenU] $XDG_DATA_HOME/AllGenURecomp, else ~/.local/share/AllGenURecomp (docs/STATUS.md "Save data",
+// runtime/platform.h). The base port used AllGenURecomp there; a player upgrading on Linux moves that folder by hand.
+static bool mkdir_p(const char *path) {
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof buf, "%s", path);
+    for (char *s = buf + 1; *s; s++) {
+        if (*s != '/') continue;
+        *s = 0;
+        if (mkdir(buf, 0777) != 0 && errno != EEXIST) return false;
+        *s = '/';
+    }
+    return mkdir(buf, 0777) == 0 || errno == EEXIST;
+}
+
+bool plat_user_dir(char *buf, size_t size) {
+    const char *base = getenv("XDG_DATA_HOME");
+    char fallback[PATH_MAX];
+    if (!base || !*base) {
+        const char *home = getenv("HOME");
+        if (!home || !*home) return false;
+        snprintf(fallback, sizeof fallback, "%s/.local/share", home);
+        base = fallback;
+    }
+    char dir[PATH_MAX];
+    if (snprintf(dir, sizeof dir, "%s/AllGenURecomp", base) >= (int)sizeof dir) return false;
+    if (!mkdir_p(dir)) return false;
+    struct stat st;
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) return false;
+    snprintf(buf, size, "%s", dir);
+    return true;
+}
+
+void plat_error_box(const char *msg) {
+    fprintf(stderr, "\n*** %s\n", msg);
+    // Best effort, and only when there is a display server to ask. Children are reaped by SIG_IGN, so this can't
+    // leave a zombie or hold the game up when neither helper is installed.
+    bool x11 = getenv("DISPLAY") != NULL;
+    if (!x11 && !getenv("WAYLAND_DISPLAY")) return;
+    static bool reaps;
+    if (!reaps) { signal(SIGCHLD, SIG_IGN); reaps = true; }
+    extern char **environ;
+    char *argv[8];
+    pid_t pid;
+    if (x11) {
+        argv[0] = (char *)"zenity";
+        argv[1] = (char *)"--error";
+        argv[2] = (char *)"--title";
+        argv[3] = (char *)"AllGenURecomp";
+        argv[4] = (char *)"--text";
+        argv[5] = (char *)msg;
+        argv[6] = NULL;
+    } else {
+        argv[0] = (char *)"kdialog";
+        argv[1] = (char *)"--title";
+        argv[2] = (char *)"AllGenURecomp";
+        argv[3] = (char *)"--error";
+        argv[4] = (char *)msg;
+        argv[5] = NULL;
+    }
+    posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);  // (detached: nobody waits for the box to close)
+}
+
+void plat_fatal_notice(void) {
+    if (g_own_log)
+        plat_error_box("The game stopped because of an error. The details are in log.txt, next to allgenurecomp.");
+}
+
+// ---- diagnostics
+const char *plat_symbol(uint64_t pc, uint64_t *offset) {
+    static __thread char name[PATH_MAX], exe[PATH_MAX];
+    Dl_info di;
+    if (!dladdr((void *)(uintptr_t)pc, &di) || !di.dli_fname) return NULL;
+    if (!exe[0] && !plat_exe_path(exe, sizeof exe)) snprintf(exe, sizeof exe, "-");
+    if (!strcmp(di.dli_fname, exe)) return NULL;  // (the caller prints "allgenurecomp+<off>" for the executable itself)
+    const char *slash = strrchr(di.dli_fname, '/');
+    snprintf(name, sizeof name, "%s", slash ? slash + 1 : di.dli_fname);
+    if (offset) *offset = pc - (uint64_t)(uintptr_t)di.dli_fbase;
+    return name;
+}
+
+const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c
+
+void plat_print_backtrace(void) {
+    void *bt[64];
+    int n = backtrace(bt, 64);
+    Dl_info self;
+    uint64_t exe = dladdr((void *)(uintptr_t)&plat_print_backtrace, &self) ? (uint64_t)(uintptr_t)self.dli_fbase : 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t pc = (uint64_t)(uintptr_t)bt[i], off = 0;
+        const char *s = rt_host_fn_name(pc, &off);
+        if (!s) s = plat_symbol(pc, &off);
+        if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
+        else fprintf(stderr, "  #%-2d %016llx allgenurecomp+%llx\n", i, (unsigned long long)pc,
+                     (unsigned long long)(exe ? pc - exe : 0));
+    }
+}
+
+static const char *sig_name(int sig) {
+    switch (sig) {
+    case SIGSEGV: return "SIGSEGV";
+    case SIGBUS: return "SIGBUS";
+    case SIGFPE: return "SIGFPE";
+    case SIGILL: return "SIGILL";
+    default: return "signal";
+    }
+}
+
+static void fault_handler(int sig, siginfo_t *si, void *uc) {
+    ucontext_t *ctx = (ucontext_t *)uc;
+    uint64_t fa = si && si->si_addr ? (uint64_t)(uintptr_t)si->si_addr : 0;
+    if ((sig == SIGSEGV || sig == SIGBUS) && lazy_commit(fa)) return;  // (a guest page first touched: back it, resume)
+    uint64_t pc = (uint64_t)ctx->uc_mcontext.gregs[REG_RIP];
+    uint64_t sp = (uint64_t)ctx->uc_mcontext.gregs[REG_RSP], lr = 0, end = 0;
+    if (plat_committed(sp, &end) && end - sp >= 8) lr = *(const uint64_t *)(uintptr_t)sp;
+    char what[80];
+    snprintf(what, sizeof what, "%s (code %d, addr %llx)", sig_name(sig), si ? si->si_code : 0,
+             (unsigned long long)fa);
+    rt_fault_report(what, fa, pc, lr);
+    _exit(139);  // (rt_fault_report does not return)
+}
+
+void plat_crash_handler_install(void) {
+    // A guard page under an exhausted stack faults with no room left to run a handler, so run it on its own stack.
+    // Signal stacks are per thread: this covers the calling thread, guest threads keep theirs.
+    static char altstack[256 * 1024] __attribute__((aligned(16)));  // (SIGSTKSZ is not a compile-time constant here)
+    stack_t ss = {.ss_sp = altstack, .ss_size = sizeof altstack}, old;
+    if (sigaltstack(NULL, &old) == 0 && !(old.ss_flags & SS_ONSTACK)) sigaltstack(&ss, NULL);
+    struct sigaction sa = {0};
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}

@@ -2,6 +2,11 @@
 
 **Port nativo para PC (Windows) de Monster Hunter Generations Ultimate (Nintendo Switch, v1.4.0) mediante recompilación estática de código (AOT — Ahead-of-Time), logrando rendimiento nativo en hardware moderno sin necesidad de emulación pesada.**
 
+**Incluye un menú llamado KZMUI para que el jugador pueda acceder a las opciones mas fácilmente inspirado en el antiguo MH3UI de OceanTriRecomp.**
+
+
+
+
 > ⚠️ **AVISO OFICIAL E IMPORTANTE:**
 > **AllGenURecomp** es una recompilación estática de *Monster Hunter Generations Ultimate (NS)*, es **completamente gratuita** y si obtuviste este port de pago **has sido estafado**, la única vía oficial es nuestro GitHub: [https://github.com/krisztsa/AllGenURecomp](https://github.com/krisztsa/AllGenURecomp).
 

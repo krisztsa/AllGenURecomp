@@ -23,7 +23,9 @@ Config g_config = {DISPLAY_BORDERLESS, 1920, 1080, 0, 0, 60, 1, 1, 0 /* [AllGenU
                    // --- [AllGenU] image look, FSR render scale and the keyboard map (host_input.c / kzmui.cpp) ---
                    0 /* hdr */, 0 /* false_dlss */, 100 /* fsr_scale: native by default; the menu slider lowers it */,
                    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0} /* keybinds: config_keybinds_default */,
-                   SDL_SCANCODE_LALT /* walk_key */};
+                   SDL_SCANCODE_LALT /* walk_key */,
+                   "" /* [AllGenU] ldn_server: the hub server for internet hubs, "Off"/empty: none (runtime/net/ldn.c) */,
+                   "" /* [AllGenU] ldn_key: the matchmaking key ("": public hubs) */};
 uint32_t g_render_size[2] = {1920, 1080};
 float g_render_aspect = 16.0f / 9.0f;
 float g_fov_scale = 1.0f;
@@ -123,6 +125,17 @@ static const char DEFAULT_INI[] =
     "; Search Hubs finds hubs on your LAN by itself. To reach a host elsewhere, put its address here: an IP or name,\n"
     "; with :port if it isn't the Port above. Several: separate them with commas. Example: Join = 203.0.113.7:39500\n"
     "Join =\n"
+    "\n"
+    "; [AllGenU] Internet hubs (ported from MHGURecomp): with a hub server set here, a created hub is also listed on\n"
+    "; it, and Search Hubs shows its hubs next to the LAN's: online play with no port forwarding and no VPN. Any\n"
+    "; host running MHGURecomp's server software works (host or host:port, port 39510). Each port lists and joins\n"
+    "; only its own kind of hub. Empty (the default): no internet hubs - the LAN and Join addresses only.\n"
+    "Server =\n"
+    "\n"
+    "; [AllGenU] The matchmaking key: hubs are listed and joined only among players with the same key, so a private\n"
+    "; circle can meet there without port forwarding (empty: public hubs, everyone's). Hubs of the two ports\n"
+    "; (AllGenURecomp / MHGURecomp) never mix: each lists and joins its own kind only.\n"
+    "Key =\n"
     "\n"
     "; Small monsters (Jaggi, Aptonoth...) synced between the players in a zone, like large monsters are: On or Off.\n"
     "; Off is the original game: each player sees them in different places. Everyone in the hunt should use the same.\n"
@@ -390,6 +403,10 @@ static void set_key(const char *key, char *val, int line) {
         else ok = false;
     } else if (!strcmp(k, "join")) {
         snprintf(g_config.ldn_join, sizeof g_config.ldn_join, "%s", val);  // (as written: names keep their dashes)
+    } else if (!strcmp(k, "server")) {  // [AllGenU] internet hubs: the hub server (runtime/net/ldn.c)
+        snprintf(g_config.ldn_server, sizeof g_config.ldn_server, "%s", val);
+    } else if (!strcmp(k, "key")) {  // [AllGenU] the matchmaking key of the hub server's rooms
+        snprintf(g_config.ldn_key, sizeof g_config.ldn_key, "%s", val);
     } else if (!strcmp(k, "bonuscontent")) {
         if (!strcmp(v, "on") || !strcmp(v, "1") || !strcmp(v, "true") || !strcmp(v, "yes")) g_config.bonus_content = 1;
         else if (!strcmp(v, "off") || !strcmp(v, "0") || !strcmp(v, "false") || !strcmp(v, "no")) g_config.bonus_content = 0;
@@ -612,6 +629,8 @@ void config_load(void) {
     if ((e = getenv("MHGU_LDN_PORT")) && atoi(e) > 0) g_config.ldn_port = atoi(e);
     if ((e = getenv("MHGU_SYNC_ZAKO"))) g_config.sync_small_monsters = atoi(e) != 0;
     if ((e = getenv("MHGU_LDN_JOIN"))) snprintf(g_config.ldn_join, sizeof g_config.ldn_join, "%s", e);
+    if ((e = getenv("MHGU_LDN_SERVER"))) snprintf(g_config.ldn_server, sizeof g_config.ldn_server, "%s", e);
+    if ((e = getenv("MHGU_LDN_KEY"))) snprintf(g_config.ldn_key, sizeof g_config.ldn_key, "%s", e);
     if ((e = getenv("MHGU_ASPECT"))) parse_aspect(e, &g_config.aspect_ratio);
     if ((e = getenv("MHGU_FOV")) && strtof(e, NULL) >= 0.5f && strtof(e, NULL) <= 2.0f) g_config.fov = strtof(e, NULL);
     if ((e = getenv("MHGU_UI_ANCHOR"))) parse_anchor(e, &g_config.ui_anchor);

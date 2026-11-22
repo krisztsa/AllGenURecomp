@@ -109,6 +109,20 @@ typedef struct { char magic[4]; uint32_t token; uint8_t kind, pad[3]; } UHdr;
 #define UDP_MAX_PAYLOAD 8192
 #define UDP_SILENCE_NS 15000000000ull
 
+// ---- the hub server (internet hubs; [AllGenU] ported from morerokk/MHGURecomp's ldn.c, whose server/server.go has
+// the protocol). Control frames like the link's; requests start with a header: "MHGS", u16 LOBBY_PROTO,
+// u16 PROTO_VERSION, room[16] (the matchmaking key's hash; hubs are listed only among the same room and version).
+#define LOBBY_PROTO 1
+#define LOBBY_PORT 39510
+#define LOBBY_HEADER 24
+enum { S_LIST = 1, S_HOST, S_ATTACH, S_JOIN, S_UPDATE, S_PING, S_HUBS = 16, S_HOSTED, S_INCOMING, S_SPLICED, S_ERROR };
+enum { SE_NOT_FOUND = 1, SE_NO_ANSWER, SE_BUSY, SE_VERSION };
+#define LOBBY_PING_NS 15000000000ull
+// A relayed link's datagrams to the server's UDP port start with this prefix ("MHGR", u32 pair, u64 secret); the
+// server strips it and passes the rest to the other end (whose address it learned from that end's first datagram).
+#define RELAY_MAGIC "MHGR"
+#define RELAY_PREFIX 16  // magic, u32 pair, u64 secret
+
 typedef struct {
     hsock s;
     pthread_mutex_t wmu;  // one writer at a time; s is closed only with it held (alive cleared first)
@@ -119,6 +133,10 @@ typedef struct {
     struct sockaddr_in uaddr;     // host side: where the station's datagrams come from
     volatile bool udp_up;
     volatile uint64_t udp_rx_ns;  // last datagram from the other end
+    // [AllGenU] internet hubs: a link relayed by the hub server (0: a direct link). The relay's pair id and our
+    // secret for its UDP datagrams ("MHGR" prefix); uaddr is then the server's address (TCP and UDP same port).
+    uint32_t relay_pair;
+    uint64_t relay_secret;
 } Link;
 
 static struct {
@@ -143,10 +161,15 @@ static struct {
     hsock us;  // UDP socket connected to the host
     pthread_t uth;
     volatile bool uth_run;
+    // [AllGenU] internet hubs: this hub's listing on the hub server (one detached thread per created hub)
+    pthread_t lobby_th;
+    volatile bool lobby_dirty;  // the NetworkInfo changed: an update goes to the server
+    struct sockaddr_in lobby_addr;
 } L = {.mu = PTHREAD_MUTEX_INITIALIZER, .listen_s = BADSOCK, .disc_s = BADSOCK, .us = BADSOCK};
 
-// Scan results: where each found network's host is.
-static struct { uint8_t bssid[6], session[16]; struct sockaddr_in addr; } found[16];
+// Scan results: where each found network's host is. [AllGenU] hub: its id on the hub server (0: a LAN / Join hub;
+// addr is then the host's own address, otherwise the hub server's).
+static struct { uint8_t bssid[6], session[16]; struct sockaddr_in addr; uint64_t hub; } found[16];
 static int nfound;
 
 static void signal_change(void) {
@@ -169,6 +192,7 @@ static const char *ipstr(uint32_t ip) {
 static uint8_t *node_at(uint8_t *info, int i) { return info + NI_NODES + i * NODE_SIZE; }
 static uint16_t rd16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }  // [AllGenU] the hub server's tickets, ids and secrets
 static void wr16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
 static void wr32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
 
@@ -242,15 +266,279 @@ static hsock connect_to(const struct sockaddr_in *a, int timeout_ms) {
     return s;
 }
 
-// One datagram: header [+ packet]. to = NULL: s is connected (a station's socket).
-static bool udp_send(hsock s, const struct sockaddr_in *to, uint32_t token, uint8_t kind, const VPacket *p,
+// "host[:port]" (port: def without one) -> its IPv4 address
+static bool resolve_host(const char *text, int def, struct sockaddr_in *out) {
+    char host[200];
+    int port = def;
+    snprintf(host, sizeof host, "%s", text);
+    char *colon = strrchr(host, ':');
+    if (colon) { *colon = 0; port = atoi(colon + 1); }
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) || !res) return false;
+    *out = *(struct sockaddr_in *)res->ai_addr;
+    out->sin_port = htons((uint16_t)port);
+    freeaddrinfo(res);
+    return true;
+}
+
+// ---- SHA-256 (only the hub server's room hash uses it: the matchmaking key never leaves the computer)
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t fill; } Sha256;
+static void sha256_init(Sha256 *s) {
+    static const uint32_t iv[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    memcpy(s->h, iv, sizeof iv);
+    s->len = 0, s->fill = 0;
+}
+static void sha256_block(Sha256 *s, const uint8_t *p) {
+    static const uint32_t K[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = (uint32_t)p[4 * i] << 24 | (uint32_t)p[4 * i + 1] << 16 | (uint32_t)p[4 * i + 2] << 8 | p[4 * i + 3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = (w[i - 15] >> 7 | w[i - 15] << 25) ^ (w[i - 15] >> 18 | w[i - 15] << 14) ^ (w[i - 15] >> 3);
+        uint32_t s1 = (w[i - 2] >> 17 | w[i - 2] << 15) ^ (w[i - 2] >> 19 | w[i - 2] << 13) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = s->h[0], b = s->h[1], c = s->h[2], d = s->h[3], e = s->h[4], f = s->h[5], g = s->h[6], h = s->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = (e >> 6 | e << 26) ^ (e >> 11 | e << 21) ^ (e >> 25 | e << 7);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + K[i] + w[i];
+        uint32_t S0 = (a >> 2 | a << 30) ^ (a >> 13 | a << 19) ^ (a >> 22 | a << 10);
+        uint32_t mj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + mj;
+        h = g, g = f, f = e, e = d + t1, d = c, c = b, b = a, a = t1 + t2;
+    }
+    s->h[0] += a, s->h[1] += b, s->h[2] += c, s->h[3] += d, s->h[4] += e, s->h[5] += f, s->h[6] += g, s->h[7] += h;
+}
+static void sha256_update(Sha256 *s, const void *data, size_t n) {
+    const uint8_t *p = data;
+    s->len += n;
+    while (n) {
+        size_t take = 64 - s->fill < n ? 64 - s->fill : n;
+        memcpy(s->buf + s->fill, p, take);
+        s->fill += take, p += take, n -= take;
+        if (s->fill == 64) sha256_block(s, s->buf), s->fill = 0;
+    }
+}
+static void sha256_hex(Sha256 *s, char out[65]) {
+    uint8_t tail[200] = {0};
+    memcpy(tail, s->buf, s->fill);
+    tail[s->fill++] = 0x80;
+    size_t total = s->fill <= 56 ? 64 : 128;
+    uint64_t bits = s->len * 8;
+    for (int i = 0; i < 8; i++) tail[total - 1 - i] = (uint8_t)(bits >> (8 * i));
+    for (size_t off = 0; off < total; off += 64) sha256_block(s, tail + off);
+    for (int i = 0; i < 8; i++) snprintf(out + 8 * i, 9, "%08x", s->h[i]);
+    out[64] = 0;
+}
+
+// ---- internet hubs: the client of the hub server (the ini Server). Ported from morerokk/MHGURecomp's ldn.c
+// (the same runtime ancestry): a created hub is listed there, Search Hubs adds its hubs to the LAN's, and joins
+// through it splice the two connections at the server, so nobody forwards a port. AllGenU's link protocol is
+// PROTO_VERSION 2: the server lists and joins hubs only among the same version, so the two ports' hubs never mix.
+enum { HUB_UNKNOWN, HUB_CHECKING, HUB_OFF, HUB_ONLINE, HUB_NOT_FOUND, HUB_UNREACHABLE, HUB_LOST, HUB_NO_ANSWER,
+       HUB_BUSY, HUB_VERSION, HUB_REFUSED };
+
+// ini Server: "Off" (or empty) = no internet hubs. Its name into out; false: none. A hub server is anyone running
+// MHGURecomp's server/server.go (morerokk asked other ports to host their own: see his issue #214).
+static bool lobby_server_of(const char *s, char *out) {
+    if (!*s || ((s[0] | 0x20) == 'o' && (s[1] | 0x20) == 'f' && (s[2] | 0x20) == 'f' && !s[3])) { *out = 0; return false; }
+    snprintf(out, sizeof g_config.ldn_server, "%s", s);
+    return true;
+}
+static bool lobby_server(char *out) {
+    char s[sizeof g_config.ldn_server];
+    snprintf(s, sizeof s, "%s", g_config.ldn_server);
+    return lobby_server_of(s, out);
+}
+
+// A request's header. The room is a hash of the matchmaking key (key NULL: ini Key; spaces around it ignored): hubs
+// are listed only for players whose key matches, all of them without one. The server never sees the key itself.
+// Android without a key: the room of the key "public-phone", so a phone's public hubs stay among phones only.
+static bool lobby_header(uint8_t *h, const char *key) {
+    static const char salt[] = "MHGURecomp matchmaking key:";
+    char live[sizeof g_config.ldn_key];
+    if (!key) snprintf(live, sizeof live, "%s", g_config.ldn_key), key = live;
+    memcpy(h, "MHGS", 4);
+    wr16(h + 4, LOBBY_PROTO);
+    wr16(h + 6, PROTO_VERSION);
+    memset(h + 8, 0, 16);
+    const char *k = key;
+    while (*k == ' ') k++;
+    size_t n = strlen(k);
+    while (n && k[n - 1] == ' ') n--;
+#ifdef __ANDROID__
+    if (!n) k = "public-phone", n = strlen(k);
+#endif
+    if (!n) return false;
+    Sha256 s;
+    char hex[65];
+    sha256_init(&s);
+    sha256_update(&s, salt, sizeof salt - 1);
+    sha256_update(&s, k, n);
+    sha256_hex(&s, hex);
+    for (int i = 0; i < 16; i++) {
+        unsigned v;
+        sscanf(hex + 2 * i, "%2x", &v);
+        h[8 + i] = (uint8_t)v;
+    }
+    return true;
+}
+
+static int lobby_state(uint32_t code) {  // a server's error as a HUB_* state
+    return code == SE_VERSION ? HUB_VERSION : code == SE_BUSY ? HUB_BUSY : HUB_REFUSED;
+}
+
+// Through the hub server, a datagram starts with "MHGR", the pair and our secret; the server passes on the rest.
+static uint32_t relay_prefix(uint8_t *buf, const Link *l) {
+    if (!l->relay_pair) return 0;
+    memcpy(buf, RELAY_MAGIC, 4);
+    wr32(buf + 4, l->relay_pair);
+    memcpy(buf + 8, &l->relay_secret, 8);
+    return RELAY_PREFIX;
+}
+// The host tells the server where its end of a relayed link is (an empty datagram, until the station's get through).
+static void relay_register(hsock s, const Link *l) {
+    uint8_t buf[RELAY_PREFIX];
+    uint32_t n = relay_prefix(buf, l);
+    if (n && l->uaddr.sin_port) sendto(s, (const char *)buf, (int)n, 0, (const struct sockaddr *)&l->uaddr, sizeof l->uaddr);
+}
+
+static bool spawn_detached(void *(*fn)(void *), void *arg) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, fn, arg)) return false;
+    pthread_detach(t);
+    return true;
+}
+
+// The hubs the server lists for a key (NULL: ini Key). A HUB_* state; ms: the request's round trip.
+#define LOBBY_LIST_MAX 24
+typedef struct {
+    uint8_t infos[LOBBY_LIST_MAX][NETINFO_SIZE];
+    uint64_t ids[LOBBY_LIST_MAX];
+    int n, state, ms;
+    struct sockaddr_in addr;
+    char server[sizeof g_config.ldn_server];
+} LobbyList;
+
+static int lobby_list(const char *srv, const char *key, int connect_ms, LobbyList *r) {
+    static __thread uint8_t buf[MAX_FRAME];
+    r->n = 0, r->ms = -1;
+    if (!resolve_host(srv, LOBBY_PORT, &r->addr)) return HUB_NOT_FOUND;
+    hsock s = connect_to(&r->addr, connect_ms);
+    if (s == BADSOCK) return HUB_UNREACHABLE;
+    uint8_t req[LOBBY_HEADER], type;
+    lobby_header(req, key);
+    hset_timeout(s, 2000);
+    uint64_t asked = plat_now_ns();
+    int n = frame_send(s, S_LIST, req, sizeof req, NULL, 0) ? frame_recv(s, &type, buf) : -1;
+    r->ms = (int)((plat_now_ns() - asked) / 1000000);
+    hclose(s);
+    if (n >= 4 && type == S_ERROR) return lobby_state(rd32(buf));
+    if (n < 4 || type != S_HUBS) return HUB_NO_ANSWER;
+    uint32_t count = rd32(buf);
+    for (uint32_t i = 0; i < count && r->n < LOBBY_LIST_MAX && 4 + (i + 1) * (8 + NETINFO_SIZE) <= (uint32_t)n; i++) {
+        const uint8_t *e = buf + 4 + i * (8 + NETINFO_SIZE);
+        r->ids[r->n] = rd64(e);
+        memcpy(r->infos[r->n++], e + 8, NETINFO_SIZE);
+    }
+    return HUB_ONLINE;
+}
+
+// The list for the game's scans: a request runs at most every 25 s, in the scan thread itself (the server answers
+// in tens of milliseconds; a request that hangs costs the scan at most ~3 s, and the LAN's hubs are already in).
+static pthread_mutex_t lobby_cache_mu = PTHREAD_MUTEX_INITIALIZER;
+static LobbyList lobby_cache;
+static uint64_t lobby_cache_at;
+
+static void lobby_refresh(void) {
+    char srv[sizeof g_config.ldn_server];
+    LobbyList r;
+    if (!lobby_server(srv)) return;
+    int st = lobby_list(srv, NULL, 1500, &r);
+    pthread_mutex_lock(&lobby_cache_mu);
+    lobby_cache = r, lobby_cache.state = st, lobby_cache_at = plat_now_ns();
+    pthread_mutex_unlock(&lobby_cache_mu);
+    if (st != HUB_ONLINE)
+        LOG("[ldn] hub server %s: %s: only LAN / Join hubs are searched\n", srv,
+            st == HUB_NOT_FOUND ? "not found" : st == HUB_UNREACHABLE ? "unreachable" : st == HUB_VERSION ? "another protocol version"
+            : st == HUB_BUSY ? "busy" : st == HUB_REFUSED ? "refused the request" : "no answer");
+    else
+        LOG("[ldn] hub server %s: %d hub(s) for this key\n", srv, r.n);
+}
+
+// The server's hubs into the scan's results (n so far, at most max): deduped against the LAN's by BSSID.
+static int lobby_merge(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, uint64_t *hubs, int n, int max) {
+    char srv[sizeof g_config.ldn_server];
+    if (!lobby_server(srv)) return n;
+    pthread_mutex_lock(&lobby_cache_mu);
+    if (plat_now_ns() - lobby_cache_at > 25000000000ull) {
+        pthread_mutex_unlock(&lobby_cache_mu);
+        lobby_refresh();
+        pthread_mutex_lock(&lobby_cache_mu);
+    }
+    if (lobby_cache.state == HUB_ONLINE) {
+        for (int i = 0; i < lobby_cache.n && n < max; i++) {
+            bool dup = false;
+            for (int j = 0; j < n; j++) dup |= !memcmp(infos[j] + NI_BSSID, lobby_cache.infos[i] + NI_BSSID, 6);
+            if (dup) continue;
+            memcpy(infos[n], lobby_cache.infos[i], NETINFO_SIZE);
+            addrs[n] = lobby_cache.addr;
+            if (hubs) hubs[n] = lobby_cache.ids[i];
+            n++;
+        }
+    }
+    pthread_mutex_unlock(&lobby_cache_mu);
+    return n;
+}
+
+// Joining a listed hub: the server asks its host to connect and splices the two. 0, else an nn::ldn result.
+static uint32_t lobby_join(const struct sockaddr_in *addr, uint64_t hub, hsock *out, uint32_t *pair, uint64_t *secret) {
+    static __thread uint8_t buf[MAX_FRAME];
+    hsock s = connect_to(addr, 3000);
+    if (s == BADSOCK) {
+        LOG("[ldn] can't reach the hub server\n");
+        return R_CONNECT_TIMEOUT;
+    }
+    uint8_t req[LOBBY_HEADER + 8], type;
+    lobby_header(req, NULL);
+    memcpy(req + LOBBY_HEADER, &hub, 8);
+    hset_timeout(s, 12000);  // (the server waits up to 10 s for the host)
+    int n = frame_send(s, S_JOIN, req, sizeof req, NULL, 0) ? frame_recv(s, &type, buf) : -1;
+    if (n >= 12 && type == S_SPLICED) {
+        *out = s, *pair = rd32(buf), *secret = rd64(buf + 4);
+        return 0;
+    }
+    hclose(s);
+    uint32_t code = n >= 4 && type == S_ERROR ? rd32(buf) : 0;
+    LOG("[ldn] joining through the hub server failed: %s\n",
+        code == SE_NOT_FOUND ? "the hub is gone" : code == SE_NO_ANSWER ? "the host did not answer"
+        : code == SE_BUSY ? "the server is busy" : code == SE_VERSION ? "the server speaks another protocol version"
+        : code ? "refused" : "no answer");
+    return code == SE_NOT_FOUND ? R_CONNECT_NOT_FOUND : code == SE_BUSY ? R_CONNECT_REJECTED : R_CONNECT_TIMEOUT;
+}
+
+// One datagram: header [+ packet]. to = NULL: s is connected (a station's socket). [AllGenU] a relayed link's
+// datagrams carry the "MHGR" prefix (pair, secret) to the hub server.
+static bool udp_send(hsock s, const struct sockaddr_in *to, const Link *l, uint8_t kind, const VPacket *p,
                      const void *data, uint32_t len) {
-    uint8_t buf[sizeof(UHdr) + sizeof(VPacket) + UDP_MAX_PAYLOAD];
+    uint8_t buf[RELAY_PREFIX + sizeof(UHdr) + sizeof(VPacket) + UDP_MAX_PAYLOAD];
     if (len > UDP_MAX_PAYLOAD) return false;
-    UHdr h = {{0}, token, kind, {0}};
+    UHdr h = {{0}, l->token, kind, {0}};
     memcpy(h.magic, UDP_MAGIC, 4);
-    memcpy(buf, &h, sizeof h);
-    uint32_t n = sizeof h;
+    uint32_t n = relay_prefix(buf, l);  // (0 for a direct link; "MHGR", pair, secret for a relayed one)
+    memcpy(buf + n, &h, sizeof h);
+    n += sizeof h;
     if (p) {
         memcpy(buf + n, p, sizeof *p);
         n += sizeof *p;
@@ -289,7 +577,7 @@ static void host_route(int from, const VPacket *p, const void *data, uint32_t le
         Link *l = &L.nodes[i];
         if (i == from || !l->alive || !(all || l->ip == p->dst_ip)) continue;
         hsock ds = L.disc_s;
-        if (!(ds != BADSOCK && udp_usable(l) && udp_send(ds, &l->uaddr, l->token, U_DATA, p, data, len)))
+        if (!(ds != BADSOCK && udp_usable(l) && udp_send(ds, &l->uaddr, l, U_DATA, p, data, len)))
             link_send(l, F_PACKET, p, sizeof *p, data, len);
     }
 }
@@ -301,7 +589,7 @@ void ldn_send(const VPacket *p, const void *data, uint32_t len) {
     if (all || p->dst_ip == L.own_ip) vsock_deliver(p, data, len);  // (a broadcast reaches the sender too)
     if (p->dst_ip == L.own_ip) return;
     hsock us = L.us;
-    if (!(us != BADSOCK && udp_usable(&L.up) && udp_send(us, NULL, L.up.token, U_DATA, p, data, len)))
+    if (!(us != BADSOCK && udp_usable(&L.up) && udp_send(us, NULL, &L.up, U_DATA, p, data, len)))
         link_send(&L.up, F_PACKET, p, sizeof *p, data, len);
 }
 
@@ -384,9 +672,10 @@ static void link_received(int from, const VPacket *p, const void *data, uint32_t
 static void push_info_locked(int except) {  // to every station: the network changed
     for (int i = 1; i < MAX_NODES; i++)
         if (i != except && L.nodes[i].alive) link_send(&L.nodes[i], F_INFO, L.info, NETINFO_SIZE, NULL, 0);
+    if (L.state == ST_AP_CREATED) L.lobby_dirty = true;  // [AllGenU] the hub server's listing follows the change
 }
 
-typedef struct { hsock s; struct sockaddr_in from; } Accepted;
+typedef struct { hsock s; struct sockaddr_in from; uint32_t relay_pair; uint64_t relay_secret; } Accepted;
 
 static void *station_thread(void *arg) {
     Accepted acc = *(Accepted *)arg;
@@ -435,6 +724,11 @@ static void *station_thread(void *arg) {
     l->s = acc.s, l->ip = L.subnet | (uint32_t)(slot + 1), l->alive = true, l->has_thread = true;
     l->th = pthread_self();
     l->token = arc4random() | 1, l->udp_up = false, l->udp_rx_ns = 0;
+    // [AllGenU] a link through the hub server: its pair and secret for the "MHGR" UDP datagrams, and the server's
+    // address (its UDP port is the TCP one). The server learns our end from an empty "MHGR" datagram at once.
+    l->relay_pair = acc.relay_pair, l->relay_secret = acc.relay_secret;
+    l->uaddr = acc.from;
+    if (l->relay_pair && L.disc_s != BADSOCK) relay_register(L.disc_s, l);
     uint8_t *nd = node_at(L.info, slot);
     memset(nd, 0, NODE_SIZE);
     wr32(nd + NODE_IP, l->ip);
@@ -484,12 +778,143 @@ static void *station_thread(void *arg) {
     return NULL;
 }
 
+// ---- internet hubs: the host side (a created hub is listed on the hub server, and the players it announces are
+// connected through it). [AllGenU] ported from morerokk/MHGURecomp's ldn.c; LOG instead of on-screen notices.
+static volatile uint32_t lobby_gen;
+typedef struct { uint32_t gen; struct sockaddr_in addr; uint64_t ticket; } LobbyTicket;
+
+static bool lobby_wait(uint32_t gen, int ms) {  // false: the network is gone
+    for (uint64_t end = plat_now_ns() + (uint64_t)ms * 1000000ull; plat_now_ns() < end && lobby_gen == gen;)
+        plat_sleep_until_ns(plat_now_ns() + 100000000ull);
+    return lobby_gen == gen;
+}
+
+// One player the server announced: a second connection to the server with the ticket, spliced to the host's end,
+// and then the same handshake a direct connection has (station_thread). Accepted holds the relay's pair and secret
+// for the "MHGR" UDP datagrams, whose target is the server (the same address and port as this connection).
+static void *lobby_attach_thread(void *arg) {
+    LobbyTicket t = *(LobbyTicket *)arg;
+    free(arg);
+    static __thread uint8_t buf[MAX_FRAME];
+    hsock s = connect_to(&t.addr, 3000);
+    if (s == BADSOCK) return NULL;
+    uint8_t req[LOBBY_HEADER + 8], type;
+    lobby_header(req, NULL);
+    memcpy(req + LOBBY_HEADER, &t.ticket, 8);
+    hset_timeout(s, 5000);
+    int n;
+    if (!frame_send(s, S_ATTACH, req, sizeof req, NULL, 0) || (n = frame_recv(s, &type, buf)) < 12 || type != S_SPLICED ||
+        lobby_gen != t.gen) {
+        LOG("[ldn] a player's connection through the hub server failed\n");
+        hclose(s);
+        return NULL;
+    }
+    Accepted *a = calloc(1, sizeof *a);
+    a->s = s, a->from = t.addr, a->relay_pair = rd32(buf), a->relay_secret = rd64(buf + 4);
+    return station_thread(a);
+}
+
+// One thread per created hub: keeps it listed (HOST, then UPDATE / PING) and opens a connection for each player
+// the server announces (INCOMING). Threads of a network that is gone (lobby_gen moved on) end by themselves.
+static void *lobby_thread(void *arg) {
+    uint32_t gen = (uint32_t)(uintptr_t)arg;
+    static __thread uint8_t buf[MAX_FRAME];
+    uint8_t req[LOBBY_HEADER + NETINFO_SIZE], type;
+    while (lobby_gen == gen) {
+        char srv[sizeof g_config.ldn_server];
+        struct sockaddr_in addr;
+        hsock s = BADSOCK;
+        if (!lobby_server(srv)) break;
+        bool named = resolve_host(srv, LOBBY_PORT, &addr);
+        if (named) s = connect_to(&addr, 3000);
+        if (s == BADSOCK) {
+            LOG("[ldn] hub server %s %s: this hub is not listed online (trying again in 30 s)\n", srv,
+                named ? "unreachable" : "not found");
+            if (!lobby_wait(gen, 30000)) break;
+            continue;
+        }
+        bool keyed = lobby_header(req, NULL);
+        pthread_mutex_lock(&L.mu);
+        memcpy(req + LOBBY_HEADER, L.info, NETINFO_SIZE);
+        L.lobby_dirty = false;
+        pthread_mutex_unlock(&L.mu);
+        hset_timeout(s, 5000);
+        int n = -1;
+        if (frame_send(s, S_HOST, req, sizeof req, NULL, 0)) n = frame_recv(s, &type, buf);
+        if (n < 8 || type != S_HOSTED) {
+            bool error = n >= 4 && type == S_ERROR;
+            LOG("[ldn] hub server %s: can't list this hub (%s); trying again in 30 s\n", srv,
+                error ? (rd32(buf) == SE_NOT_FOUND ? "refused" : rd32(buf) == SE_NO_ANSWER ? "no answer"
+                       : rd32(buf) == SE_BUSY ? "busy" : rd32(buf) == SE_VERSION ? "another protocol version"
+                       : "refused") : "no answer");
+            hclose(s);
+            if (!lobby_wait(gen, 30000)) break;
+            continue;
+        }
+        pthread_mutex_lock(&L.mu);
+        L.lobby_addr = addr;
+        pthread_mutex_unlock(&L.mu);
+        LOG("[ldn] hub listed on the hub server %s: %s\n", srv,
+            keyed ? "players with the same matchmaking key see it" : "public, every AllGenU player sees it");
+        uint64_t now = plat_now_ns(), last_rx = now, next_ping = now + LOBBY_PING_NS;
+        while (lobby_gen == gen) {
+            now = plat_now_ns();
+            if (L.lobby_dirty) {
+                uint8_t info[NETINFO_SIZE];
+                pthread_mutex_lock(&L.mu);
+                memcpy(info, L.info, NETINFO_SIZE);
+                L.lobby_dirty = false;
+                pthread_mutex_unlock(&L.mu);
+                if (!frame_send(s, S_UPDATE, info, NETINFO_SIZE, NULL, 0)) break;
+            }
+            if (now >= next_ping) {
+                if (!frame_send(s, S_PING, NULL, 0, NULL, 0)) break;
+                next_ping = now + LOBBY_PING_NS;
+            }
+            if (now - last_rx > 3 * LOBBY_PING_NS) break;
+            fd_set r;
+            FD_ZERO(&r);
+            FD_SET(s, &r);
+            struct timeval tv = {0, 200000};
+            if (select((int)s + 1, &r, NULL, NULL, &tv) <= 0) continue;
+            if ((n = frame_recv(s, &type, buf)) < 0) break;
+            last_rx = plat_now_ns();
+            if (type == S_INCOMING && n >= 8) {
+                LobbyTicket *t = malloc(sizeof *t);
+                t->gen = gen, t->addr = addr, t->ticket = rd64(buf);
+                if (!spawn_detached(lobby_attach_thread, t)) free(t);
+            }
+        }
+        hclose(s);
+        if (lobby_gen != gen) break;
+        LOG("[ldn] lost the hub server: this hub is not listed online (trying again in 10 s)\n");
+        if (!lobby_wait(gen, 10000)) break;
+    }
+    return NULL;
+}
+
+static void lobby_host_start(void) {
+    uint32_t gen = ++lobby_gen;
+    char srv[sizeof g_config.ldn_server];
+    if (lobby_server(srv)) spawn_detached(lobby_thread, (void *)(uintptr_t)gen);
+}
+static void lobby_host_stop(void) { lobby_gen++; }
+
 // Accepts stations and answers LAN discovery probes until the listening sockets close.
 static void *host_thread(void *arg) {
     (void)arg;
     for (;;) {
         hsock ls = L.listen_s, ds = L.disc_s;
         if (ls == BADSOCK) break;
+        // [AllGenU] relayed links: until the station's datagrams get through, the server learns our UDP end anew
+        static uint64_t next_register;
+        uint64_t nownow = plat_now_ns();
+        if (ds != BADSOCK && nownow >= next_register) {
+            next_register = nownow + 1000000000ull;
+            for (int i = 1; i < MAX_NODES; i++)
+                if (L.nodes[i].alive && L.nodes[i].relay_pair && !udp_usable(&L.nodes[i]))
+                    relay_register(ds, &L.nodes[i]);
+        }
         fd_set r;
         FD_ZERO(&r);
         FD_SET(ls, &r);
@@ -510,10 +935,22 @@ static void *host_thread(void *arg) {
             else pthread_detach(t);
         }
         if (ds != BADSOCK && FD_ISSET(ds, &r)) {
-            static uint8_t probe[sizeof(UHdr) + sizeof(VPacket) + UDP_MAX_PAYLOAD];
+            static uint8_t probe[RELAY_PREFIX + sizeof(UHdr) + sizeof(VPacket) + UDP_MAX_PAYLOAD];
             struct sockaddr_in from;
             socklen_t fl = sizeof from;
             int n = recvfrom(ds, (char *)probe, sizeof probe, 0, (struct sockaddr *)&from, &fl);
+            // [AllGenU] a relayed link's datagrams: "MHGR", the pair and our secret, from the hub server. Once the
+            // pair's secret matches a live link, what follows is that station's datagram as always.
+            if (n >= RELAY_PREFIX + (int)sizeof(UHdr) && !memcmp(probe, RELAY_MAGIC, 4)) {
+                Link *rl = NULL;
+                for (int i = 1; i < MAX_NODES && !rl; i++) {
+                    Link *l2 = &L.nodes[i];
+                    if (l2->alive && l2->relay_pair && l2->relay_pair == rd32(probe + 4) && l2->relay_secret == rd64(probe + 8)) rl = l2;
+                }
+                if (!rl) continue;  // (anything else: dropped)
+                memmove(probe, probe + RELAY_PREFIX, (size_t)n - RELAY_PREFIX);
+                n -= RELAY_PREFIX;
+            }
             if (n >= (int)sizeof(UHdr) && !memcmp(probe, UDP_MAGIC, 4)) {  // a station's datagram
                 UHdr h;
                 memcpy(&h, probe, sizeof h);
@@ -524,9 +961,9 @@ static void *host_thread(void *arg) {
                 l->uaddr = from;  // (NAT may change it: the latest wins)
                 l->udp_rx_ns = plat_now_ns();
                 if (h.kind == U_HELLO) {
-                    if (!l->udp_up) LOG("[ldn] node %d: game packets go by UDP\n", slot);
+                    if (!l->udp_up) LOG("[ldn] node %d: game packets go by UDP%s\n", slot, l->relay_pair ? " through the hub server" : "");
                     l->udp_up = true;
-                    udp_send(ds, &from, h.token, U_HELLO_ACK, NULL, NULL, 0);
+                    udp_send(ds, &from, l, U_HELLO_ACK, NULL, NULL, 0);
                 } else if (h.kind == U_DATA && n >= (int)(sizeof h + sizeof(VPacket))) {
                     VPacket p;
                     memcpy(&p, probe + sizeof h, sizeof p);
@@ -572,10 +1009,12 @@ static bool host_start(void) {
     pthread_create(&L.host_th, NULL, host_thread, NULL);
     LOG("[ldn] hosting: players join this computer's address, port %d (TCP, and UDP for LAN search and game packets)\n",
         g_config.ldn_port);
+    lobby_host_start();  // [AllGenU] also listed on the hub server, for online play without a forwarded port
     return true;
 }
 
 static void host_stop(uint32_t reason) {  // (caller: not holding L.mu)
+    lobby_host_stop();  // [AllGenU] the hub server's listing ends with the hub
     if (L.hosting) {
         L.hosting = false;
         pthread_join(L.host_th, NULL);
@@ -638,7 +1077,7 @@ static void *station_udp_thread(void *arg) {
     while (L.uth_run) {
         uint64_t now = plat_now_ns();
         if (now >= next_hello) {
-            udp_send(us, NULL, L.up.token, U_HELLO, NULL, NULL, 0);
+            udp_send(us, NULL, &L.up, U_HELLO, NULL, NULL, 0);
             next_hello = now + (L.up.udp_up ? 2000000000ull : 500000000ull);
         }
         int n = recv(us, (char *)buf, sizeof buf, 0);
@@ -702,8 +1141,9 @@ static int scan_addresses(struct sockaddr_in *out, int max) {
     return n;
 }
 
-// Collects the networks of hosts that answer: by address (TCP) and by LAN broadcast (UDP).
-static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, int max) {
+// Collects the networks of hosts that answer: by address (TCP), by LAN broadcast (UDP), and [AllGenU] the hub
+// server's internet hubs (each with its id in hubs, 0 for the LAN's).
+static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, uint64_t *hubs, int max) {
     hnet_init();
     int n = 0;
     static __thread uint8_t buf[MAX_FRAME];
@@ -757,7 +1197,7 @@ static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, i
         addrs[n++] = from;
     }
     hclose(u);
-    return n;
+    return lobby_merge(infos, addrs, hubs, n, max);  // [AllGenU] the hub server's hubs next to the LAN's
 }
 
 // ---- nn::ldn
@@ -987,12 +1427,14 @@ HLE_FUNC("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", ldn_scan)
     if (L.state != ST_STATION && L.state != ST_ACCESS_POINT) { RET(R_INVALID_STATE); return; }
     static uint8_t infos[16][NETINFO_SIZE];
     struct sockaddr_in addrs[16];
-    int n = discover(infos, addrs, 16), k = 0;
+    uint64_t hubs[16] = {0};
+    int n = discover(infos, addrs, hubs, 16), k = 0;
     nfound = 0;
     for (int i = 0; i < n; i++) {
         if (!filter_ok(infos[i], filter)) continue;
         memcpy(found[nfound].bssid, infos[i] + NI_BSSID, 6);
         memcpy(found[nfound].session, infos[i] + NI_SESSION_ID, 16);
+        found[nfound].hub = hubs[i];
         found[nfound++].addr = addrs[i];
         if (k < max) memcpy((uint8_t *)G2H(out) + (size_t)k++ * NETINFO_SIZE, infos[i], NETINFO_SIZE);
     }
@@ -1007,8 +1449,16 @@ static uint32_t connect_network(const uint8_t *info, const uint8_t *user, uint16
     int i = 0;
     while (i < nfound && memcmp(found[i].bssid, info + NI_BSSID, 6)) i++;
     if (i == nfound) return R_CONNECT_NOT_FOUND;
-    hsock s = connect_to(&found[i].addr, 3000);
-    if (s == BADSOCK) { LOG("[ldn] can't reach the host at %s\n", inet_ntoa(found[i].addr.sin_addr)); return R_CONNECT_TIMEOUT; }
+    hsock s;
+    uint32_t pair = 0;
+    uint64_t secret = 0;
+    if (found[i].hub) {  // [AllGenU] an internet hub: joined through the hub server (nobody forwards a port)
+        uint32_t r = lobby_join(&found[i].addr, found[i].hub, &s, &pair, &secret);
+        if (r) return r;
+    } else if ((s = connect_to(&found[i].addr, 3000)) == BADSOCK) {
+        LOG("[ldn] can't reach the host at %s\n", inet_ntoa(found[i].addr.sin_addr));
+        return R_CONNECT_TIMEOUT;
+    }
     L.lcv = lcv;
     Hello h = make_hello(false, user);
     static uint8_t buf[MAX_FRAME];
@@ -1034,6 +1484,7 @@ static uint32_t connect_network(const uint8_t *info, const uint8_t *user, uint16
     pthread_mutex_init(&L.up.wmu, NULL);
     L.up.s = s, L.up.alive = true, L.up.ip = L.subnet | 1;
     L.up.token = rd32(buf + 4), L.up.udp_up = false, L.up.udp_rx_ns = 0;
+    L.up.relay_pair = pair, L.up.relay_secret = secret;  // [AllGenU] 0: a direct connection to the host
     L.state = ST_STATION_CONNECTED, L.reason = DR_NONE;
     pthread_mutex_unlock(&L.mu);
     L.up.has_thread = pthread_create(&L.up.th, NULL, uplink_thread, NULL) == 0;

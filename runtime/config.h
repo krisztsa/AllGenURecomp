@@ -57,6 +57,9 @@ typedef struct {
     int fsr_scale;            // [AllGenU] FSR's internal render scale, percent of the window (50..100; 100 = native)
     int keybinds[16];         // [AllGenU] keyboard key (SDL scancode) per guest button, BTN_* order (host_input.c)
     int walk_key;             // [AllGenU] key held for a half left-stick tilt (walk; was Left Shift)
+    // --- [AllGenU] internet hubs (ported from morerokk/MHGURecomp's hub server client, runtime/net/ldn.c) ---
+    char ldn_server[128];     // the hub server's host[:port] (port 39510 without one); "Off": no internet hubs
+    char ldn_key[64];         // the matchmaking key: only players with the same one see each other's hubs ("": public)
 } Config;
 enum { UI_CENTER = 1, UI_21_9, UI_32_9, UI_EDGES };  // the middle 16:9, 21:9, 32:9, the picture's sides
 

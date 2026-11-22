@@ -12,6 +12,7 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -1173,8 +1174,23 @@ static int discover(uint8_t (*infos)[NETINFO_SIZE], struct sockaddr_in *addrs, u
     struct sockaddr_in to = {0};
     to.sin_family = AF_INET;
     to.sin_port = htons((uint16_t)g_config.ldn_port);
-    to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
-    sendto(u, (const char *)probe, sizeof probe, 0, (struct sockaddr *)&to, sizeof to);
+    // [AllGenU] 255.255.255.255 sai pela rota default no Linux (nunca chega à interface
+    // ZeroTier, que não carrega broadcast global): mandar o probe como broadcast DIRIGIDO
+    // de cada interface IPv4 local (addr | ~máscara), que roteia pela interface certa.
+    struct ifaddrs *ifas = NULL;
+    if (getifaddrs(&ifas) == 0) {
+        for (struct ifaddrs *it = ifas; it; it = it->ifa_next) {
+            if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
+            struct sockaddr_in *a = (struct sockaddr_in *)it->ifa_addr;
+            struct sockaddr_in *m = (struct sockaddr_in *)it->ifa_netmask;
+            uint32_t addr = ntohl(a->sin_addr.s_addr);
+            if ((addr & 0xFF000000) == 0x7F000000) continue;   // loopback: já sondado abaixo
+            uint32_t mask = m ? ntohl(m->sin_addr.s_addr) : 0;
+            to.sin_addr.s_addr = htonl(mask ? (addr | ~mask) : 0xFFFFFFFF);
+            sendto(u, (const char *)probe, sizeof probe, 0, (struct sockaddr *)&to, sizeof to);
+        }
+        freeifaddrs(ifas);
+    }
     to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sendto(u, (const char *)probe, sizeof probe, 0, (struct sockaddr *)&to, sizeof to);
     uint64_t end = plat_now_ns() + 400000000ull;
